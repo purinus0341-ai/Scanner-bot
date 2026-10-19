@@ -57,10 +57,7 @@ except ImportError:
 # 2. คลาสตัวกลางเชื่อมต่อโมดูลคำนวณ (Features + HMM Regime + Liquidation + Risk)
 # ---------------------------------------------------------------------------
 class DeepAlphaQuantPipeline:
-    """
-    รวบรวมการคำนวณจาก features.py, regime_detector.py, liquidation_levels.py
-    และ risk_manager.py มาวิเคราะห์สภาพตลาดและคำนวณจุดเข้า/ออกที่เหมาะสมที่สุด
-    """
+    """ รวบรวมการคำนวณจาก features.py, regime_detector.py, liquidation_levels.py และ risk_manager.py มาวิเคราะห์สภาพตลาดและคำนวณจุดเข้า/ออกที่เหมาะสมที่สุด """
 
     def __init__(self, equity_usdt: float = 1000.0, leverage: int = 5):
         self.equity = equity_usdt
@@ -68,10 +65,7 @@ class DeepAlphaQuantPipeline:
         self.risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "5.0")) / 100.0
 
     def compute_market_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        เรียกใช้ฟังก์ชันสกัดฟีเจอร์จาก features.py หากมี หรือคำนวณ RSI, ATR, EMA,
-        Hurst Exponent และ Volume Ratio เพิ่มลงใน DataFrame
-        """
+        """ เรียกใช้ฟังก์ชันสกัดฟีเจอร์จาก features.py หากมี หรือคำนวณ RSI, ATR, EMA, Hurst Exponent และ Volume Ratio เพิ่มลงใน DataFrame """
         df = df.copy()
         # ลองเรียกฟังก์ชันจาก features.py อัตโนมัติหากชื่อตรงกับมาตรฐานใน Repo
         if da_features is not None:
@@ -104,10 +98,7 @@ class DeepAlphaQuantPipeline:
         return df
 
     def detect_regime(self, df: pd.DataFrame) -> str:
-        """
-        แยกสภาวะตลาด 3 สถานะ (BULL, BEAR, SIDEWAYS) โดยเรียก regime_detector.py
-        หรือประเมินจากโครงสร้าง EMA + ความผันผวน
-        """
+        """ แยกสภาวะตลาด 3 สถานะ (BULL, BEAR, SIDEWAYS) โดยเรียก regime_detector.py หรือประเมินจากโครงสร้าง EMA + ความผันผวน """
         if da_regime is not None:
             for cls_name in ("RegimeDetector", "HMMRegimeDetector"):
                 if hasattr(da_regime, cls_name):
@@ -125,13 +116,8 @@ class DeepAlphaQuantPipeline:
             return "BEAR"
         return "SIDEWAYS"
 
-    def optimize_tp_sl_with_liquidation(
-        self, entry_price: float, atr: float, side: str, regime: str
-    ) -> dict:
-        """
-        ปรับระยะ Take Profit (3 ระดับ) และ Stop Loss ตามสภาวะตลาด (HMM Regime)
-        และหลบโซน Liquidation Cluster (5x - 20x Leverage)
-        """
+    def optimize_tp_sl_with_liquidation( self, entry_price: float, atr: float, side: str, regime: str ) -> dict:
+        """ ปรับระยะ Take Profit (3 ระดับ) และ Stop Loss ตามสภาวะตลาด (HMM Regime) และหลบโซน Liquidation Cluster (5x - 20x Leverage) """
         # ปรับตัวคูณตามสภาวะตลาดตามตรรกะของ DeepAlpha
         if regime == "BULL" and side == "buy":
             tp_mult, sl_mult = 1.25, 1.0
@@ -255,6 +241,110 @@ pipeline = DeepAlphaQuantPipeline(
 engine = ExecutionEngine()
 
 
+# ---------------------------------------------------------------------------
+# 5. ระบบ Auto-Scanner กวาดสแกนเหรียญอัตโนมัติ (ฟรี 100% ไม่ต้องใช้ TradingView)
+# ---------------------------------------------------------------------------
+DEFAULT_SCAN_SYMBOLS = [
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT",
+    "XRP/USDT:USDT", "BNB/USDT:USDT", "PEPE/USDT:USDT", "SUI/USDT:USDT",
+    "NEAR/USDT:USDT", "AVAX/USDT:USDT", "LINK/USDT:USDT", "ADA/USDT:USDT",
+    "APT/USDT:USDT", "SHIB/USDT:USDT", "DOT/USDT:USDT"
+]
+
+scanner_stats = {
+    "enabled": os.getenv("ENABLE_AUTO_SCANNER", "true").lower() == "true",
+    "last_scan_time": None,
+    "scanned_symbols_count": len(DEFAULT_SCAN_SYMBOLS),
+    "total_detected_signals": 0,
+    "recent_signals": [],
+}
+
+
+def run_auto_scanner_loop():
+    logger.info("เริ่มต้นระบบ Auto Multi-Coin Scanner ใน Background Thread (ฟรี 100%)...")
+    scan_interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "90"))
+    max_positions = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+
+    # รอให้เซิร์ฟเวอร์หลักเริ่มทำงานเรียบร้อยก่อนสแกนรอบแรก
+    time.sleep(5)
+
+    while True:
+        try:
+            if not scanner_stats["enabled"]:
+                time.sleep(10)
+                continue
+
+            current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            scanner_stats["last_scan_time"] = current_time
+            detected_in_cycle = []
+
+            for symbol in DEFAULT_SCAN_SYMBOLS:
+                open_symbols = [p.get("symbol") for p in engine.paper_positions]
+                if symbol in open_symbols:
+                    continue
+
+                if len(engine.paper_positions) >= max_positions:
+                    break
+
+                try:
+                    df = engine.fetch_ohlcv_df(symbol, timeframe="1h", limit=30)
+                    if df.empty or len(df) < 20:
+                        continue
+
+                    df = pipeline.compute_market_features(df)
+                    regime = pipeline.detect_regime(df)
+
+                    last_row = df.iloc[-1]
+                    vol_ratio = float(last_row.get("vol_ratio", 1.0))
+                    rsi = float(last_row.get("rsi_14", 50.0))
+
+                    # เงื่อนไขเข้าเทรด: Volume พุ่ง (>= 1.5x) + โมเมนตัม RSI >= 50 + ตลาด BULL
+                    # หรือวอลุ่มพุ่งแรงมาก (>= 2.5x) และ RSI >= 55
+                    is_bull_setup = (regime == "BULL" and vol_ratio >= 1.5 and rsi >= 50.0)
+                    is_breakout = (vol_ratio >= 2.5 and rsi >= 55.0)
+
+                    if is_bull_setup or is_breakout:
+                        last_close = float(last_row["close"])
+                        last_atr = float(last_row["atr_14"]) if "atr_14" in df.columns and not pd.isna(last_row["atr_14"]) else (last_close * 0.02)
+
+                        logger.info(f"🔥 [AUTO SCANNER] ตรวจพบสัญญาณ {symbol} (VolRatio={vol_ratio:.2f}, RSI={rsi:.1f}, Regime={regime})")
+                        plan = pipeline.optimize_tp_sl_with_liquidation(
+                            entry_price=last_close, atr=last_atr, side="buy", regime=regime
+                        )
+                        engine.execute_trade_plan(symbol, plan)
+
+                        sig_data = {
+                            "time": current_time,
+                            "symbol": symbol,
+                            "vol_ratio": round(vol_ratio, 2),
+                            "rsi": round(rsi, 1),
+                            "regime": regime,
+                            "entry_price": last_close
+                        }
+                        detected_in_cycle.append(sig_data)
+                        scanner_stats["total_detected_signals"] += 1
+
+                except Exception as err:
+                    logger.warning(f"Error scanning {symbol}: {err}")
+
+                time.sleep(0.5)
+
+            if detected_in_cycle:
+                scanner_stats["recent_signals"] = (detected_in_cycle + scanner_stats["recent_signals"])[:10]
+
+        except Exception as loop_err:
+            logger.error(f"Error in auto scanner loop: {loop_err}")
+
+        time.sleep(scan_interval)
+
+
+@app.on_event("startup")
+def startup_event():
+    if scanner_stats["enabled"]:
+        t = threading.Thread(target=run_auto_scanner_loop, daemon=True)
+        t.start()
+
+
 @app.get("/")
 @app.get("/status")
 def get_status():
@@ -262,6 +352,13 @@ def get_status():
         "status": "online",
         "paper_mode": engine.paper_mode,
         "exchange": engine.exchange_name,
+        "auto_scanner": {
+            "enabled": scanner_stats["enabled"],
+            "last_scan_time": scanner_stats["last_scan_time"],
+            "scanned_symbols_count": scanner_stats["scanned_symbols_count"],
+            "total_detected_signals": scanner_stats["total_detected_signals"],
+            "recent_signals": scanner_stats["recent_signals"][:5]
+        },
         "open_paper_positions": len(engine.paper_positions),
         "positions": engine.paper_positions[-10:],
     }
@@ -269,11 +366,7 @@ def get_status():
 
 @app.post("/webhook/tradingview")
 async def tradingview_webhook(request: Request):
-    """
-    รับ JSON จาก TradingView Alert เช่น:
-    {"action": "buy", "symbol": "BTC/USDT:USDT", "key": "รหัสลับของคุณ"}
-    แล้วนำมาคำนวณฟีเจอร์ + กรองสภาวะตลาด HMM + คำนวณระยะ TP/SL ก่อนเปิดออเดอร์
-    """
+    """ รับ JSON จาก TradingView Alert เช่น: {"action": "buy", "symbol": "BTC/USDT:USDT", "key": "รหัสลับของคุณ"} แล้วนำมาคำนวณฟีเจอร์ + กรองสภาวะตลาด HMM + คำนวณระยะ TP/SL ก่อนเปิดออเดอร์ """
     try:
         payload = await request.json()
     except Exception:
