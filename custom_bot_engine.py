@@ -42,12 +42,6 @@ except ImportError:
 # 2. ระบบจัดเก็บข้อมูลถาวรฟรี 100% (Telegram Cloud Backup + Supabase Free Tier)
 # ---------------------------------------------------------------------------
 class FreePersistentStorage:
-    """
-    รองรับการเก็บข้อมูลพอร์ตจำลองแบบฟรี 2 ช่องทาง:
-    1. Telegram Pinned Message State (ฟรี 100% ใช้แค่ Token & Chat ID เดิม ไม่ต้องสมัครเว็บเพิ่ม)
-    2. Supabase Free Tier REST API (ทางเลือกเสริม หากตั้งค่า SUPABASE_URL และ SUPABASE_KEY)
-    """
-
     def __init__(self):
         self.tg_token = os.getenv("TELEGRAM_TOKEN", "")
         self.tg_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -62,8 +56,6 @@ class FreePersistentStorage:
         }
 
     def save_state(self, positions: list, realized_pnl: float, history: list):
-        """บันทึกสถานะพอร์ตปัจจุบันลง Cloud ฟรี"""
-        # 1. บันทึกลง Supabase (ถ้าตั้งค่าไว้)
         if self.supa_enabled:
             try:
                 payload = {
@@ -82,7 +74,6 @@ class FreePersistentStorage:
             except Exception as err:
                 logger.debug(f"Supabase save warning: {err}")
 
-        # 2. บันทึกลง Telegram Pinned Message (ฟรีและไม่ต้องสมัคร Database เพิ่ม)
         if self.tg_token and self.tg_chat_id:
             try:
                 state_json = json.dumps({
@@ -126,8 +117,6 @@ class FreePersistentStorage:
                 logger.debug(f"Telegram state backup warning: {err}")
 
     def load_state(self) -> tuple[list, float, list]:
-        """กู้คืนข้อมูลพอร์ตอัตโนมัติเมื่อ Render รีสตาร์ท"""
-        # 1. ลองโหลดจาก Supabase ก่อน
         if self.supa_enabled:
             try:
                 res = requests.get(
@@ -145,7 +134,6 @@ class FreePersistentStorage:
             except Exception as err:
                 logger.debug(f"Supabase load warning: {err}")
 
-        # 2. โหลดจากข้อความปักหมุดใน Telegram (Fallback ฟรี 100%)
         if self.tg_token and self.tg_chat_id:
             try:
                 chat_res = requests.get(
@@ -218,7 +206,6 @@ class DeepAlphaQuantPipeline:
                     except Exception:
                         pass
 
-        # ใช้แท่งที่ปิดสมบูรณ์แล้ว (iloc[-2]) ร่วมกับแท่งปัจจุบันเพื่อความแม่นยำ
         last = df.iloc[-1]
         if last["close"] > last["ema_20"] > last["ema_50"] and last["rsi_14"] > 52:
             return "BULL"
@@ -247,7 +234,6 @@ class DeepAlphaQuantPipeline:
         raw_sl_dist = max(1.2 * atr * sl_mult, entry_price * 0.015)
         sl = entry_price - direction * raw_sl_dist
 
-        # คำนวณทบต้นตามพอร์ตจำลองปัจจุบัน (Dynamic Compounding)
         margin_usdt = max(current_equity, 100.0) * self.risk_pct
         notional_usdt = margin_usdt * self.leverage
         qty = round(notional_usdt / entry_price, 4)
@@ -296,14 +282,17 @@ class ExecutionEngine:
     def current_equity(self) -> float:
         return round(self.initial_equity + self.realized_total_pnl, 2)
 
-    def send_telegram(self, message: str):
+    def send_telegram(self, message: str, reply_markup: Optional[dict] = None):
         token = os.getenv("TELEGRAM_TOKEN", "")
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         if token and chat_id:
             try:
+                payload = {"chat_id": chat_id, "text": message}
+                if reply_markup:
+                    payload["reply_markup"] = reply_markup
                 requests.post(
                     f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={"chat_id": chat_id, "text": message},
+                    json=payload,
                     timeout=5,
                 )
             except Exception as err:
@@ -340,8 +329,64 @@ class ExecutionEngine:
         )
         return {"status": "live_filled", "order_id": order.get("id"), "trade": plan}
 
+    async def manual_close_position(self, target_symbol: str, exchange_async) -> str:
+        """ฟังก์ชันปิดไม้ด้วยมือผ่านคำสั่ง Telegram"""
+        target_upper = target_symbol.upper().strip()
+        matched_pos = None
+        for pos in self.paper_positions:
+            sym = pos["symbol"].upper()
+            if sym == target_upper or sym.startswith(target_upper + "/"):
+                matched_pos = pos
+                break
+
+        if not matched_pos:
+            return f"⚠️ ไม่พบไม้ที่เปิดอยู่สำหรับเหรียญ `{target_symbol}`"
+
+        symbol = matched_pos["symbol"]
+        try:
+            ticker = await exchange_async.fetch_ticker(symbol)
+            current_price = float(ticker["last"])
+        except Exception:
+            current_price = float(matched_pos.get("last_price") or matched_pos["entry_price"])
+
+        entry = float(matched_pos["entry_price"])
+        rem_qty = float(matched_pos.get("remaining_qty", matched_pos["qty"]))
+        realized = float(matched_pos.get("realized_pnl", 0.0))
+        is_buy = (matched_pos["side"] == "buy")
+
+        pnl = (current_price - entry) * rem_qty if is_buy else (entry - current_price) * rem_qty
+        realized += pnl
+        self.realized_total_pnl += pnl
+
+        matched_pos["remaining_qty"] = 0.0
+        matched_pos["realized_pnl"] = round(realized, 2)
+        matched_pos["closed_at"] = datetime.utcnow().isoformat()
+        matched_pos["exit_reason"] = f"สั่งปิดด้วยมือผ่าน Telegram ที่ {current_price}"
+        matched_pos["unrealized_pnl"] = 0.0
+
+        self.paper_positions.remove(matched_pos)
+        self.closed_history.append(matched_pos)
+        self.storage.save_state(self.paper_positions, self.realized_total_pnl, self.closed_history)
+
+        return (
+            f"✅ ปิดไม้ {symbol} สำเร็จที่ราคา {current_price}\n"
+            f"PnL สุทธิไม้นี้: {realized:+.2f} USDT\n"
+            f"💰 พอร์ตจำลองปัจจุบัน: {self.current_equity:.2f} USDT"
+        )
+
+    async def close_all_positions(self, exchange_async) -> str:
+        """ปิดทุกไม้ในพอร์ตทันทีผ่านคำสั่ง Telegram"""
+        if not self.paper_positions:
+            return "ℹ️ ปัจจุบันไม่มีไม้ที่เปิดค้างอยู่ในพอร์ตครับ"
+
+        symbols = [pos["symbol"] for pos in list(self.paper_positions)]
+        reports = []
+        for sym in symbols:
+            res = await self.manual_close_position(sym, exchange_async)
+            reports.append(res)
+        return "🚨 สรุปการปิดทุกไม้ทันที:\n\n" + "\n\n".join(reports)
+
     async def check_paper_exits(self, exchange_async):
-        """ตรวจจับราคาเรียลไทม์เพื่อแบ่งปิด TP1 (33%), TP2 (33%), TP3 (34%) หรือตัดขาดทุน SL"""
         if not self.paper_positions:
             return
 
@@ -375,14 +420,12 @@ class ExecutionEngine:
             realized = float(pos.get("realized_pnl", 0.0))
             is_buy = (side == "buy")
 
-            # คำนวณ Unrealized PnL ของส่วนที่เหลือ
             unrealized = (current_price - entry) * rem_qty if is_buy else (entry - current_price) * rem_qty
             pos["unrealized_pnl"] = round(unrealized, 2)
 
             closed_all = False
             exit_reason = ""
 
-            # 1. เช็คชน SL
             if (is_buy and current_price <= sl) or (not is_buy and current_price >= sl):
                 pnl = (current_price - entry) * rem_qty if is_buy else (entry - current_price) * rem_qty
                 realized += pnl
@@ -391,7 +434,6 @@ class ExecutionEngine:
                 closed_all = True
                 exit_reason = f"ชน SL ที่ {current_price}"
 
-            # 2. เช็คชน TP3 (ปิดทั้งหมดที่เหลือ)
             elif (is_buy and current_price >= tp3) or (not is_buy and current_price <= tp3):
                 pnl = (current_price - entry) * rem_qty if is_buy else (entry - current_price) * rem_qty
                 realized += pnl
@@ -400,7 +442,6 @@ class ExecutionEngine:
                 closed_all = True
                 exit_reason = f"ชนเป้าสูงสุด TP3 ที่ {current_price}"
 
-            # 3. เช็คชน TP2 (แบ่งปิด 33% และเลื่อน SL ไปที่ TP1)
             elif not pos.get("tp2_hit") and ((is_buy and current_price >= tp2) or (not is_buy and current_price <= tp2)):
                 close_qty = round(total_qty * 0.33, 4)
                 pnl = (current_price - entry) * close_qty if is_buy else (entry - current_price) * close_qty
@@ -415,7 +456,6 @@ class ExecutionEngine:
                     f"กำไรล็อกแล้ว: {realized:+.2f} USDT | ย้าย SL ล็อกกำไรที่ {tp1}"
                 )
 
-            # 4. เช็คชน TP1 (แบ่งปิด 33% และเลื่อน SL มาบังทุน)
             elif not pos.get("tp1_hit") and ((is_buy and current_price >= tp1) or (not is_buy and current_price <= tp1)):
                 close_qty = round(total_qty * 0.33, 4)
                 pnl = (current_price - entry) * close_qty if is_buy else (entry - current_price) * close_qty
@@ -453,7 +493,7 @@ class ExecutionEngine:
 
 
 # ---------------------------------------------------------------------------
-# 5. ระบบ Async Dynamic Scanner (ดึง Top Gainers + สแกนพร้อมกันใน 1.5 วินาที)
+# 5. ระบบ Async Dynamic Scanner
 # ---------------------------------------------------------------------------
 DEFAULT_SCAN_SYMBOLS = [
     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "DOGE/USDT:USDT",
@@ -481,7 +521,6 @@ scanner_stats = {
 
 
 async def get_dynamic_top_symbols(exchange_async, top_n: int = 15) -> list:
-    """คัดเลือกเหรียญ Futures ที่สภาพคล่องสูงและกำลังวิ่งแรง (Dynamic Top Gainers)"""
     try:
         tickers = await exchange_async.fetch_tickers()
         candidates = []
@@ -490,7 +529,6 @@ async def get_dynamic_top_symbols(exchange_async, top_n: int = 15) -> list:
                 continue
             quote_vol = float(data.get("quoteVolume") or 0.0)
             change_pct = float(data.get("percentage") or 0.0)
-            # คัดเหรียญที่มี Volume 24 ชม. เกิน 3 ล้าน USDT และบวกอยู่ระหว่าง 1.5% ถึง 35%
             if quote_vol >= 3_000_000 and 1.5 <= change_pct <= 35.0:
                 candidates.append((symbol, change_pct, quote_vol))
 
@@ -503,10 +541,8 @@ async def get_dynamic_top_symbols(exchange_async, top_n: int = 15) -> list:
 
 
 async def scan_single_symbol(symbol: str, exchange_async, sem: asyncio.Semaphore) -> Optional[dict]:
-    """สแกนเหรียญแบบ Async พร้อมตัวกรอง Alpha ลดสัญญาณหลอก (False Breakout)"""
     async with sem:
         try:
-            # ดึง 100 แท่งเพื่อให้ EMA50 และ ATR14 แม่นยำเต็ม 100%
             ohlcv = await exchange_async.fetch_ohlcv(symbol, timeframe="1h", limit=100)
             if not ohlcv or len(ohlcv) < 55:
                 return None
@@ -516,7 +552,7 @@ async def scan_single_symbol(symbol: str, exchange_async, sem: asyncio.Semaphore
             regime = pipeline.detect_regime(df)
 
             curr = df.iloc[-1]
-            prev = df.iloc[-2]  # แท่งก่อนหน้าที่ปิดสมบูรณ์แล้ว
+            prev = df.iloc[-2]
 
             vol_ratio = float(curr.get("vol_ratio", 1.0))
             rsi = float(curr.get("rsi_14", 50.0))
@@ -524,21 +560,17 @@ async def scan_single_symbol(symbol: str, exchange_async, sem: asyncio.Semaphore
             ema_20 = float(curr["ema_20"])
             atr = float(curr["atr_14"]) if not pd.isna(curr["atr_14"]) else (close_price * 0.02)
 
-            # 1. กรองไส้เทียนบนยาวเกิน 40% (ป้องกันการไล่ราคาแล้วโดนทุบสวน)
             candle_range = float(curr["high"] - curr["low"])
             upper_wick = float(curr["high"] - curr["close"])
             if candle_range > 0 and (upper_wick / candle_range) > 0.40:
                 return None
 
-            # 2. กรองราคาที่ฉีกห่างจาก EMA20 เกิน 2.2 ATR (ป้องกันการซื้อติดดอย)
             if (close_price - ema_20) > (2.2 * atr):
                 return None
 
-            # 3. กรอง RSI ให้อยู่ในโซนมีโมเมนตัมแต่ยังไม่ Overbought จัด (52 - 73)
             if not (52.0 <= rsi <= 73.0):
                 return None
 
-            # 4. เงื่อนไขเข้าเทรด: ตลาด BULL + Volume พุ่ง + เบรค High หรือยืนเหนือ EMA20 แข็งแกร่ง
             is_bull_breakout = (
                 regime == "BULL"
                 and vol_ratio >= 1.5
@@ -548,7 +580,6 @@ async def scan_single_symbol(symbol: str, exchange_async, sem: asyncio.Semaphore
             if not is_bull_breakout:
                 return None
 
-            # 5. เช็ค Funding Rate (ถ้าเกิน 0.05% แปลว่าฝั่ง Long แออัดเกินไป ข้ามทันที)
             funding_rate = 0.0
             try:
                 f_data = await exchange_async.fetch_funding_rate(symbol)
@@ -577,75 +608,239 @@ async def scan_single_symbol(symbol: str, exchange_async, sem: asyncio.Semaphore
             return None
 
 
-async def async_master_scanner_loop():
+# ---------------------------------------------------------------------------
+# 6. ระบบ Telegram Bot Command Center (ควบคุมบอทผ่านแชท + ปุ่มกดลัด)
+# ---------------------------------------------------------------------------
+TELEGRAM_KEYBOARD = {
+    "keyboard": [
+        [{"text": "📊 เช็คพอร์ต"}, {"text": "📂 ไม้ที่ถืออยู่"}],
+        [{"text": "🔥 เหรียญซิ่งวันนี้"}, {"text": "📜 ประวัติเทรด"}],
+        [{"text": "⏸️ พักสแกน"}, {"text": "▶️ เปิดสแกน"}, {"text": "🚨 ปิดทุกไม้ทันที"}],
+    ],
+    "resize_keyboard": True,
+}
+
+
+async def handle_telegram_command(text: str, exchange_async):
+    cmd = text.strip()
+    cmd_lower = cmd.lower()
+
+    # 1. เช็คสถานะพอร์ต
+    if cmd_lower in ("/start", "/help", "help", "เมนู"):
+        msg = (
+            "🤖 *ศูนย์ควบคุมบอท DeepAlpha*\n\n"
+            "กดปุ่มเมนูด้านล่าง หรือพิมพ์คำสั่ง:\n"
+            "• `/status` - เช็คยอดเงินและกำไรสุทธิ\n"
+            "• `/positions` - ดูเหรียญที่ถืออยู่\n"
+            "• `/watchlist` - ดู 15 เหรียญซิ่งที่กำลังสแกน\n"
+            "• `/history` - ดูประวัติ 5 ไม้ล่าสุดที่ปิดแล้ว\n"
+            "• `/close SOL` - สั่งปิดเหรียญนั้นทันที\n"
+            "• `/closeall` - ปิดทุกไม้ในพอร์ตทันที\n"
+            "• `/pause` / `/resume` - พัก/เปิดสแกนเนอร์\n"
+            "• `/reset` - รีเซ็ตพอร์ตจำลองเริ่มใหม่"
+        )
+        engine.send_telegram(msg, reply_markup=TELEGRAM_KEYBOARD)
+
+    elif cmd_lower in ("/status", "📊 เช็คพอร์ต"):
+        unrealized = sum(float(p.get("unrealized_pnl", 0.0)) for p in engine.paper_positions)
+        net_eq = engine.current_equity + unrealized
+        scan_state = "🟢 ทำงานปกติ" if scanner_stats["enabled"] else "⏸️ พักการสแกนชั่วคราว"
+        msg = (
+            f"📊 *สถานะพอร์ตจำลอง (Paper Portfolio)*\n"
+            f"• สถานะสแกนเนอร์: {scan_state}\n"
+            f"• ทุนเริ่มต้น: {engine.initial_equity:.2f} USDT\n"
+            f"• กำไรสะสมที่ปิดแล้ว: {engine.realized_total_pnl:+.2f} USDT\n"
+            f"• กำไรไม้ที่ถืออยู่: {unrealized:+.2f} USDT\n"
+            f"💰 *มูลค่าพอร์ตสุทธิ: {net_eq:.2f} USDT*\n\n"
+            f"• ถือครองอยู่: {len(engine.paper_positions)} ไม้ | ปิดแล้ว: {len(engine.closed_history)} ไม้\n"
+            f"• สแกนล่าสุด: {scanner_stats['last_scan_time'] or 'กำลังเริ่ม...'} ({scanner_stats['scan_duration_sec']}s)"
+        )
+        engine.send_telegram(msg, reply_markup=TELEGRAM_KEYBOARD)
+
+    # 2. ดูไม้ที่ถืออยู่
+    elif cmd_lower in ("/positions", "📂 ไม้ที่ถืออยู่"):
+        if not engine.paper_positions:
+            engine.send_telegram("📂 ปัจจุบันไม่มีไม้ที่เปิดถือครองอยู่ครับ", reply_markup=TELEGRAM_KEYBOARD)
+            return
+        lines = ["📂 *รายการไม้ที่กำลังถืออยู่:*"]
+        for i, p in enumerate(engine.paper_positions, 1):
+            sym = p["symbol"].replace(":USDT", "")
+            u_pnl = float(p.get("unrealized_pnl", 0.0))
+            r_pnl = float(p.get("realized_pnl", 0.0))
+            last_p = p.get("last_price", p["entry_price"])
+            lines.append(
+                f"\n{i}. *{sym}* ({p['side'].upper()})\n"
+                f"   เข้า: {p['entry_price']} | ล่าสุด: {last_p}\n"
+                f"   เหลือ: {p.get('remaining_qty', p['qty'])} | SL: {p['sl']}\n"
+                f"   TP1: {p['tp1_33pct']} {'✅' if p.get('tp1_hit') else '⏳'} | "
+                f"TP2: {p['tp2_33pct']} {'✅' if p.get('tp2_hit') else '⏳'} | TP3: {p['tp3_34pct_trail']}\n"
+                f"   PnL รอรับรู้: {u_pnl:+.2f} USDT (ล็อกแล้ว: {r_pnl:+.2f})\n"
+                f"   👉 พิมพ์ `/close {sym.split('/')[0]}` เพื่อปิดไม้นี้"
+            )
+        engine.send_telegram("\n".join(lines), reply_markup=TELEGRAM_KEYBOARD)
+
+    # 3. ดูรายชื่อเหรียญซิ่งประจำวัน
+    elif cmd_lower in ("/watchlist", "🔥 เหรียญซิ่งวันนี้"):
+        coins = [c.replace("/USDT:USDT", "") for c in scanner_stats["current_watchlist"]]
+        msg = (
+            f"🔥 *15 เหรียญ Dynamic Top Gainers ที่กำลังเฝ้าสแกน:*\n"
+            f"{', '.join(coins)}\n\n"
+            f"⏱️ ใช้เวลาสแกนรอบละ: {scanner_stats['scan_duration_sec']} วินาที"
+        )
+        engine.send_telegram(msg, reply_markup=TELEGRAM_KEYBOARD)
+
+    # 4. ดูประวัติไม้ที่ปิดไปแล้ว
+    elif cmd_lower in ("/history", "📜 ประวัติเทรด"):
+        if not engine.closed_history:
+            engine.send_telegram("📜 ยังไม่มีประวัติไม้ที่ปิดจบแล้วครับ", reply_markup=TELEGRAM_KEYBOARD)
+            return
+        lines = ["📜 *ประวัติ 5 ไม้ล่าสุดที่ปิดแล้ว:*"]
+        for p in engine.closed_history[-5:]:
+            sym = p["symbol"].replace(":USDT", "")
+            pnl = float(p.get("realized_pnl", 0.0))
+            icon = "🟢" if pnl >= 0 else "🔴"
+            lines.append(f"{icon} *{sym}*: {pnl:+.2f} USDT ({p.get('exit_reason', 'Closed')})")
+        engine.send_telegram("\n".join(lines), reply_markup=TELEGRAM_KEYBOARD)
+
+    # 5. พักและเปิดสแกนเนอร์
+    elif cmd_lower in ("/pause", "⏸️ พักสแกน"):
+        scanner_stats["enabled"] = False
+        engine.send_telegram("⏸️ สั่งพักการสแกนหาเหรียญใหม่ชั่วคราวแล้วครับ (ระบบเช็ค TP/SL ของไม้เดิมยังทำงานปกติ)", reply_markup=TELEGRAM_KEYBOARD)
+
+    elif cmd_lower in ("/resume", "▶️ เปิดสแกน"):
+        scanner_stats["enabled"] = True
+        engine.send_telegram("▶️ เปิดระบบ Auto-Scanner กวาดหาเหรียญซิ่งต่อแล้วครับ!", reply_markup=TELEGRAM_KEYBOARD)
+
+    # 6. สั่งปิดทุกไม้ทันที
+    elif cmd_lower in ("/closeall", "🚨 ปิดทุกไม้ทันที"):
+        reply = await engine.close_all_positions(exchange_async)
+        engine.send_telegram(reply, reply_markup=TELEGRAM_KEYBOARD)
+
+    # 7. สั่งปิดรายเหรียญ เช่น /close SOL
+    elif cmd_lower.startswith("/close "):
+        coin = cmd.split(" ", 1)[1].strip()
+        reply = await engine.manual_close_position(coin, exchange_async)
+        engine.send_telegram(reply, reply_markup=TELEGRAM_KEYBOARD)
+
+    # 8. รีเซ็ตพอร์ตจำลองใหม่
+    elif cmd_lower == "/reset":
+        engine.paper_positions = []
+        engine.realized_total_pnl = 0.0
+        engine.closed_history = []
+        storage.save_state([], 0.0, [])
+        engine.send_telegram(
+            f"🔄 รีเซ็ตพอร์ตจำลองเรียบร้อย! เริ่มต้นนับหนึ่งใหม่ที่ทุน {engine.initial_equity:.2f} USDT ครับ",
+            reply_markup=TELEGRAM_KEYBOARD,
+        )
+
+
+async def telegram_command_listener_loop(exchange_async):
+    """ลูปดึงข้อความคำสั่งจาก Telegram แบบ Long-Polling (ไม่กินทรัพยากรเครื่อง)"""
+    token = os.getenv("TELEGRAM_TOKEN", "")
+    authorized_chat_id = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+    if not token or not authorized_chat_id:
+        logger.info("ไม่ได้ตั้งค่า TELEGRAM_TOKEN / TELEGRAM_CHAT_ID ข้ามการเปิดรับคำสั่ง Telegram")
+        return
+
+    logger.info("📱 เปิดระบบรับคำสั่งควบคุมบอทผ่าน Telegram เรียบร้อย...")
+    offset = 0
+
+    # ส่งปุ่มเมนูต้อนรับเมื่อบอทเริ่มทำงาน
+    engine.send_telegram(
+        "🟢 *บอท DeepAlpha ออนไลน์พร้อมรับคำสั่งแล้วครับ!*\nกดปุ่มเมนูด้านล่างเพื่อเช็คพอร์ตหรือควบคุมบอทได้เลย",
+        reply_markup=TELEGRAM_KEYBOARD,
+    )
+
+    while True:
+        try:
+            res = await asyncio.to_thread(
+                requests.get,
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params={"offset": offset, "timeout": 15},
+                timeout=20,
+            )
+            data = res.json()
+            if data.get("ok"):
+                for item in data.get("result", []):
+                    offset = item["update_id"] + 1
+                    msg = item.get("message", {})
+                    sender_chat_id = str(msg.get("chat", {}).get("id", ""))
+                    text = msg.get("text", "")
+
+                    # ตรวจสอบสิทธิ์: รับคำสั่งเฉพาะจาก Chat ID ของเจ้าของบอทเท่านั้น
+                    if sender_chat_id == authorized_chat_id and text:
+                        await handle_telegram_command(text, exchange_async)
+        except Exception as err:
+            logger.debug(f"Telegram polling warning: {err}")
+            await asyncio.sleep(5)
+
+        await asyncio.sleep(1)
+
+
+async def async_master_scanner_loop(exchange_async):
     logger.info("🚀 เริ่มต้นระบบ Async Dynamic Scanner & Paper Exit Engine (ฟรี 100%)...")
     scan_interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "90"))
     max_positions = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
-    sem = asyncio.Semaphore(5)  # จำกัดสแกนพร้อมกันทีละ 5 เหรียญเพื่อกัน Rate Limit
-
-    ex_class = getattr(ccxt_async, engine.exchange_name)
-    exchange_async = ex_class({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+    sem = asyncio.Semaphore(5)
 
     await asyncio.sleep(3)
-    try:
-        while True:
-            loop_start = time.time()
-            try:
-                # 1. ตรวจเช็ค TP1, TP2, TP3 และ SL ของไม้ที่ถืออยู่ทั้งหมด
-                await engine.check_paper_exits(exchange_async)
+    while True:
+        loop_start = time.time()
+        try:
+            await engine.check_paper_exits(exchange_async)
 
-                # 2. กวาดสแกนหาเหรียญใหม่แบบ Async เมื่อพอร์ตยังว่าง
-                if scanner_stats["enabled"] and len(engine.paper_positions) < max_positions:
-                    watchlist = await get_dynamic_top_symbols(exchange_async, top_n=15)
-                    scanner_stats["current_watchlist"] = watchlist
-                    scanner_stats["scanned_symbols_count"] = len(watchlist)
+            if scanner_stats["enabled"] and len(engine.paper_positions) < max_positions:
+                watchlist = await get_dynamic_top_symbols(exchange_async, top_n=15)
+                scanner_stats["current_watchlist"] = watchlist
+                scanner_stats["scanned_symbols_count"] = len(watchlist)
 
-                    open_symbols = {p["symbol"] for p in engine.paper_positions}
-                    targets = [s for s in watchlist if s not in open_symbols]
+                open_symbols = {p["symbol"] for p in engine.paper_positions}
+                targets = [s for s in watchlist if s not in open_symbols]
 
-                    tasks = [scan_single_symbol(sym, exchange_async, sem) for sym in targets]
-                    results = await asyncio.gather(*tasks)
+                tasks = [scan_single_symbol(sym, exchange_async, sem) for sym in targets]
+                results = await asyncio.gather(*tasks)
 
-                    current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-                    scanner_stats["last_scan_time"] = current_time
-                    scanner_stats["scan_duration_sec"] = round(time.time() - loop_start, 2)
+                current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                scanner_stats["last_scan_time"] = current_time
+                scanner_stats["scan_duration_sec"] = round(time.time() - loop_start, 2)
 
-                    for res in results:
-                        if res and len(engine.paper_positions) < max_positions:
-                            sym = res["symbol"]
-                            engine.execute_trade_plan(sym, res["plan"])
-                            sig_info = {
-                                "time": current_time,
-                                "symbol": sym,
-                                "vol_ratio": res["vol_ratio"],
-                                "rsi": res["rsi"],
-                                "funding_rate": res["funding_rate"],
-                                "regime": res["regime"],
-                                "entry_price": res["plan"]["entry_price"],
-                            }
-                            scanner_stats["recent_signals"] = ([sig_info] + scanner_stats["recent_signals"])[:10]
-                            scanner_stats["total_detected_signals"] += 1
-                else:
-                    scanner_stats["last_scan_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-                    scanner_stats["scan_duration_sec"] = round(time.time() - loop_start, 2)
+                for res in results:
+                    if res and len(engine.paper_positions) < max_positions:
+                        sym = res["symbol"]
+                        engine.execute_trade_plan(sym, res["plan"])
+                        sig_info = {
+                            "time": current_time,
+                            "symbol": sym,
+                            "vol_ratio": res["vol_ratio"],
+                            "rsi": res["rsi"],
+                            "funding_rate": res["funding_rate"],
+                            "regime": res["regime"],
+                            "entry_price": res["plan"]["entry_price"],
+                        }
+                        scanner_stats["recent_signals"] = ([sig_info] + scanner_stats["recent_signals"])[:10]
+                        scanner_stats["total_detected_signals"] += 1
+            else:
+                scanner_stats["last_scan_time"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                scanner_stats["scan_duration_sec"] = round(time.time() - loop_start, 2)
 
-            except Exception as err:
-                logger.error(f"Error in master scanner cycle: {err}")
+        except Exception as err:
+            logger.error(f"Error in master scanner cycle: {err}")
 
-            await asyncio.sleep(scan_interval)
-    finally:
-        await exchange_async.close()
+        await asyncio.sleep(scan_interval)
 
 
 # ---------------------------------------------------------------------------
-# 6. FastAPI Server & Endpoints
+# 7. FastAPI Server & Endpoints
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Custom DeepAlpha Async Quant Engine")
 
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(async_master_scanner_loop())
+    ex_class = getattr(ccxt_async, engine.exchange_name)
+    exchange_async = ex_class({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+    asyncio.create_task(async_master_scanner_loop(exchange_async))
+    asyncio.create_task(telegram_command_listener_loop(exchange_async))
 
 
 @app.get("/")
