@@ -5,20 +5,29 @@ on:
       symbol:
         description: Market
         type: choice
-        options: [BTCUSDT, ETHUSDT]
+        options:
+          - BTCUSDT
+          - ETHUSDT
         default: BTCUSDT
       bars:
         description: Number of 15m candles
+        type: choice
+        options:
+          - '1000'
+          - '2000'
+          - '4000'
         default: '2000'
 permissions:
   contents: read
 jobs:
   backtest:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r futures_scanner/requirements.txt
+      - run: python -m pip install -r futures_scanner/requirements.txt
+      - run: python -m pytest futures_scanner/tests -q
       - run: python -m futures_scanner.backtest --symbol "${{ inputs.symbol }}" --bars "${{ inputs.bars }}"
