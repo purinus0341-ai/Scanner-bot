@@ -1,0 +1,37 @@
+name: Crypto futures scanner (signals only)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '3,18,33,48 * * * *'
+permissions:
+  contents: write
+concurrency:
+  group: futures-scanner
+  cancel-in-progress: false
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r futures_scanner/requirements.txt
+      - run: python -m pytest futures_scanner/tests -q
+      - name: Scan and notify
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m futures_scanner.main
+      - name: Save alert dedup state
+        run: |
+          if ! git diff --quiet -- futures_scanner/state.json; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add futures_scanner/state.json
+            git commit -m 'chore: record futures alerts'
+            git push
+          fi
