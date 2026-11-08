@@ -1,0 +1,24 @@
+name: Crypto futures backtest
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: Market
+        type: choice
+        options: [BTCUSDT, ETHUSDT]
+        default: BTCUSDT
+      bars:
+        description: Number of 15m candles
+        default: '2000'
+permissions:
+  contents: read
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r futures_scanner/requirements.txt
+      - run: python -m futures_scanner.backtest --symbol "${{ inputs.symbol }}" --bars "${{ inputs.bars }}"
