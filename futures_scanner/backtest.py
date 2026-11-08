@@ -1,13 +1,14 @@
 import argparse,json,pandas as pd
-from .core import fetch,closed,signal
+from .core import fetch,closed,signal,PROVIDER
 from .paper import settle
 def history(symbol,interval,bars):
     chunks=[];end=None;count=0
     while count<bars:
-        n=min(1500,bars-count);d=fetch(symbol,interval,n,end)
+        n=min(1000,bars-count);d=fetch(symbol,interval,n,end)
         if d.empty:break
         chunks.append(d);count+=len(d);end=int(d.open_time.iloc[0])-1
         if len(d)<n:break
+    if not chunks:raise RuntimeError("No historical candles")
     return pd.concat(chunks).sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
 def run(symbol,bars=2000,capital=50.0):
     a=closed(history(symbol,"15m",bars));h=closed(history(symbol,"1h",max(500,bars//4+220)))
@@ -30,7 +31,7 @@ def run(symbol,bars=2000,capital=50.0):
         if qty*price>min(equity*1.8,90):continue
         pos={**s,"entry":price,"qty":qty}
     gains=sum(max(0,t["pnl"]) for t in trades);loss=-sum(min(0,t["pnl"]) for t in trades)
-    result={"symbol":symbol,"trades":len(trades),"net_pnl":sum(t["pnl"] for t in trades),"end_equity":equity,"profit_factor":gains/loss if loss else None,"max_drawdown_pct":dd*100,"note":"Simulation only; funding not modeled"}
+    result={"provider":PROVIDER,"symbol":symbol,"trades":len(trades),"net_pnl":sum(t["pnl"] for t in trades),"end_equity":equity,"profit_factor":gains/loss if loss else None,"max_drawdown_pct":dd*100,"note":"Simulation only; funding and minimum lots not modeled"}
     print(json.dumps(result,indent=2));return result
 if __name__=="__main__":
     p=argparse.ArgumentParser();p.add_argument("--symbol",choices=["BTCUSDT","ETHUSDT"],default="BTCUSDT");p.add_argument("--bars",type=int,default=2000)
