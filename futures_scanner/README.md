@@ -9,3 +9,6 @@ python -m futures_scanner.main
 python -m futures_scanner.backtest --symbol BTCUSDT --bars 2000
 ## Limits
 50 USDT account, theoretical risk 0.5 USDT per signal, BTCUSDT and ETHUSDT 15m entries / 1h trend. No live execution. No guaranteed profitability. Backtest is simplified: does not model funding, partial fills, or exchange minimum orders; a signal is not an instruction to trade. Scheduled jobs can be delayed. Public Binance Futures endpoints may be blocked in some jurisdictions. Keep secrets out of code.
+
+## Market data provider (November 2026)
+Binance Futures `fapi.binance.com` returned HTTP 451 on GitHub-hosted runner. The scanner now reads **Bybit public USDT perpetual** candles from `/v5/market/kline` (15-minute and 60-minute). This is a **different exchange** with different prices, volume and fees; historical results and alerts are not directly comparable to Binance. It does not trade on either exchange. If Bybit also blocks access, the workflow fails clearly rather than bypassing restrictions or inventing signals. Verify local eligibility and exchange terms. GitHub-hosted network access has not yet been live-tested after this change.
