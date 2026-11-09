@@ -1,26 +1,29 @@
 import os,time,requests,pandas as pd,numpy as np
-BASE=os.getenv("MARKET_DATA_BASE","https://api.bybit.com").rstrip("/")
+BASE=os.getenv("MARKET_DATA_BASE","https://api.hyperliquid.xyz").rstrip("/")
 SYMBOLS=("BTCUSDT","ETHUSDT")
-PROVIDER="Bybit USDT perpetual (public market data)"
+PROVIDER="Hyperliquid USDC-margined perpetual (public market data)"
 def fetch(symbol,interval,limit=500,end_time=None):
-    if symbol not in SYMBOLS or interval not in ("15m","1h"): raise ValueError("Unsupported market")
-    minutes=15 if interval=="15m" else 60
-    params={"category":"linear","symbol":symbol,"interval":str(minutes),"limit":min(int(limit),1000)}
-    if end_time is not None:params["end"]=int(end_time)
+    if symbol not in SYMBOLS or interval not in ("15m","1h"):raise ValueError("Unsupported market")
+    if not 1<=int(limit)<=500:raise ValueError("Limit must be 1..500")
+    duration=900000 if interval=="15m" else 3600000
+    end=int(time.time()*1000) if end_time is None else int(end_time)
+    start=end-int(limit)*duration
+    coin=symbol.replace("USDT","")
+    payload={"type":"candleSnapshot","req":{"coin":coin,"interval":interval,"startTime":start,"endTime":end}}
     try:
-        r=requests.get(BASE+"/v5/market/kline",params=params,timeout=20)
+        r=requests.post(BASE+"/info",json=payload,timeout=25)
         r.raise_for_status()
     except requests.HTTPError as e:
-        if r.status_code in (403,451):raise RuntimeError(f"{PROVIDER} market data unavailable (HTTP {r.status_code}); check access restrictions; no signals sent") from e
+        if r.status_code in (403,451):raise RuntimeError(f"{PROVIDER} market data unavailable (HTTP {r.status_code}); no signals sent") from e
         raise
-    payload=r.json()
-    if payload.get("retCode")!=0:raise RuntimeError(f"Market API error: {payload.get('retCode')} {payload.get('retMsg')}")
-    rows=payload.get("result",{}).get("list",[])
-    if not isinstance(rows,list) or not rows:raise RuntimeError("Market API returned no candles")
-    d=pd.DataFrame(rows,columns=["open_time","open","high","low","close","volume","turnover"])
-    for c in ("open_time","open","high","low","close","volume"):d[c]=pd.to_numeric(d[c],errors="raise")
-    d["close_time"]=d.open_time+minutes*60000-1
-    d=d.sort_values("open_time").drop_duplicates("open_time").reset_index(drop=True)
+    rows=r.json()
+    if not isinstance(rows,list):raise RuntimeError("Invalid Hyperliquid candles response")
+    if not rows:
+        return pd.DataFrame(columns=["open_time","open","high","low","close","volume","close_time"])
+    d=pd.DataFrame([{"open_time":v["t"],"close_time":v["T"],"open":v["o"],"high":v["h"],"low":v["l"],"close":v["c"],"volume":v["v"]} for v in rows])
+    for c in ("open_time","close_time","open","high","low","close","volume"):d[c]=pd.to_numeric(d[c],errors="raise")
+    d=d[(d.open_time>=start)&(d.open_time<end)].sort_values("open_time").drop_duplicates("open_time").tail(int(limit)).reset_index(drop=True)
+    if d.empty:raise RuntimeError("No candles in requested time window")
     if (d.open_time.diff().dropna()<=0).any():raise RuntimeError("Invalid candle chronology")
     return d
 def closed(d,now=None):
@@ -52,4 +55,4 @@ def signal(d15,d1h,symbol,risk=0.5):
     if dist<=0 or target<=0 or dist/entry>.04:return None
     qty=risk/(dist+(entry+stop)*.0007);notional=qty*entry
     if notional>90:return None
-    return dict(id=f"bybit:{symbol}:{int(v.open_time)}:{side}",symbol=symbol,side=side,entry=entry,stop=stop,target=target,qty=qty,notional=notional,risk=risk,rsi=float(v.rsi),volume_ratio=float(v.volume/v.volavg),close_time=int(v.close_time))
+    return dict(id=f"hyperliquid:{symbol}:{int(v.open_time)}:{side}",symbol=symbol,side=side,entry=entry,stop=stop,target=target,qty=qty,notional=notional,risk=risk,rsi=float(v.rsi),volume_ratio=float(v.volume/v.volavg),close_time=int(v.close_time))
